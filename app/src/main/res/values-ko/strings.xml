@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="general_close">닫기</string>
+    <string name="general_continue">계속</string>
+    <string name="general_ok">확인</string>
+    <string name="general_cancel">취소</string>
+    <string name="general_settings">설정</string>
+    <string name="general_licenses">라이센스</string>
+    <string name="general_record">녹음</string>
+    <string name="general_share">공유</string>
+    <string name="general_delete">삭제</string>
+    <string name="general_deleted">삭제됨</string>
+    <string name="permissions_title">권한 설정</string>
+    <string name="permissions_intro">녹음을 시작하려면 몇 가지 권한이 필요합니다. ‘접근 권한 허용’을 누른 후 각 항목을 승인해 주세요.</string>
+    <string name="permissions_grant_access">접근 권한 허용</string>
+    <string name="permissions_status_required">필수</string>
+    <string name="permission_call_log_description">전화 상태 이벤트에서 가려지지 않은 전화번호를 수신하기 위해 필요합니다.</string>
+    <string name="permission_manage_ongoing_calls_label">진행 중인 통화 관리</string>
+    <string name="general_system_limitation">시스템 제한 사항</string>
+</resources>

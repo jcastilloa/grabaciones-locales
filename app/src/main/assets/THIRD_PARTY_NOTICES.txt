@@ -1,0 +1,31 @@
+# Third-party notices
+
+This file identifies upstream projects and notices relevant to components adapted or bundled by Grabaciones Locales. Full license texts available in `licenses/` are also copied to `app/src/main/assets/` where indicated.
+
+## ShizuCallRecorder
+
+The original call-detection and recording application is [ShizuCallRecorder](https://github.com/kitsumed/ShizuCallRecorder), by kitsumed (Med). Reused source files retain their original notices. It is licensed under GPL-3.0-or-later with the additional terms in the root `LICENSE`. This modified fork is renamed, uses a different package ID, and provides visible fork attribution and a repository link in the app.
+
+## CallVault
+
+The embedded-ADB architecture, mDNS endpoint handling, and foreground pairing notification/RemoteInput flow are adapted from [CallVault](https://github.com/madkongo/CallVault), by the CallVault Authors. Its `LICENSE` is byte-for-byte identical to this project's root `LICENSE` (GPL-3.0-or-later with the same Section 7 additional terms). Adapted source files identify CallVault in their headers; the app UI links to the project.
+
+## Shizuku ADB mDNS
+
+`AdbMdns.kt` is adapted from [RikkaApps/Shizuku](https://github.com/RikkaApps/Shizuku), `manager/src/main/java/moe/shizuku/manager/adb/AdbMdns.kt`, under Apache License 2.0. The license text is in `licenses/Apache-2.0.txt` and the app assets.
+
+## Embedded ADB dependencies
+
+- [`libadb-android` 3.1.1](https://github.com/MuntashirAkon/libadb-android): copyright 2021 Muntashir Al-Islam; dual licensed GPL-3.0-or-later or Apache-2.0. This project uses the Apache-2.0 option. The library has a runtime dependency on Spake2 noted below.
+- [`spake2-android` 2.2.1](https://github.com/MuntashirAkon/spake2-java/tree/2.2.1): LGPL-3.0. License text: `licenses/Spake2-LGPL-3.0.txt`; corresponding upstream source is available at the linked repository/tag.
+- Spake2's modified EdDSA-Java implementation is identified upstream as CC0 1.0; the notice is in `licenses/EdDSA-CC0-1.0.txt`.
+- [Bouncy Castle `bcprov-jdk15to18` 1.81](https://github.com/bcgit/bc-java): MIT license, in `licenses/BouncyCastle-MIT.txt` (the upstream HTML copy is also included).
+- [Conscrypt Android 2.5.2](https://github.com/google/conscrypt): Apache-2.0, in `licenses/Conscrypt-Apache-2.0.txt`.
+
+## Audio encoder
+
+[LAME 3.100](https://sourceforge.net/projects/lame/files/lame/3.100/) is bundled as a shared library under LGPL-2.0-or-later. License text is in `licenses/LAME-LGPL-2.0.txt` and app assets.
+
+## AndroidX
+
+AndroidX and Jetpack Compose dependencies are provided under Apache-2.0; see the corresponding Google Maven artifacts and their notices.
