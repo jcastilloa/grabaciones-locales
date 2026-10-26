@@ -25,6 +25,7 @@ import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.cancellation.CancellationException
 
 /** Owns the persisted wireless-ADB identity, shell connection and recorder Binder lifecycle. */
 object EmbeddedAdbManager {
@@ -32,6 +33,7 @@ object EmbeddedAdbManager {
     private const val CONNECT_DISCOVERY_TIMEOUT_MS = 12_000L
     private const val CONNECT_HANDSHAKE_TIMEOUT_MS = 8_000L
     private const val BINDER_WAIT_TIMEOUT_MS = 18_000L
+    private const val DAEMON_LAUNCH_ATTEMPTS = 3
     private const val LOOPBACK_RECOVERY_TIMEOUT_MS = 12_000L
     private const val LOOPBACK_RETRY_INTERVAL_MS = 750L
     private const val ADB_READ_TIMEOUT_MS = 2_000L
@@ -146,15 +148,31 @@ object EmbeddedAdbManager {
             grantSecureSettingsIfNeeded(appContext, adb)
 
             shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return@withLock it }
-            killStaleDaemons(adb)
-            launchDaemon(appContext, adb)
-
-            return@withLock awaitShellService()
+            var lastFailure: Throwable? = null
+            repeat(DAEMON_LAUNCH_ATTEMPTS) { attempt ->
+                shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return@withLock it }
+                killStaleDaemons(adb)
+                launchDaemon(appContext, adb)
+                try {
+                    return@withLock awaitShellService(BINDER_WAIT_TIMEOUT_MS / DAEMON_LAUNCH_ATTEMPTS)
+                } catch (failure: Throwable) {
+                    if (failure is CancellationException) throw failure
+                    lastFailure = failure
+                    if (attempt + 1 < DAEMON_LAUNCH_ATTEMPTS) {
+                        AppLogger.w(TAG, "Daemon launch attempt ${attempt + 1} failed; rebuilding ADB transport")
+                        disconnectBounded(adb)
+                        val recovered = if (offline) connectLoopback(appContext, adb) else false
+                        if (!recovered && isWifiConnected(appContext)) connectWireless(appContext, adb)
+                    }
+                }
+            }
+            throw (lastFailure as? IOException
+                ?: IOException("No se pudo entregar el Binder del daemon tras $DAEMON_LAUNCH_ATTEMPTS intentos.", lastFailure))
         }
     }
 
-    private suspend fun awaitShellService(): IShellService {
-        val deadline = System.currentTimeMillis() + BINDER_WAIT_TIMEOUT_MS
+    private suspend fun awaitShellService(timeoutMs: Long = BINDER_WAIT_TIMEOUT_MS): IShellService {
+        val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return it }
             delay(150)
