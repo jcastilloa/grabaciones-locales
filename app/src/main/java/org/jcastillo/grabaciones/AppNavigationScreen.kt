@@ -85,6 +85,7 @@ import org.jcastillo.grabaciones.onboarding.OnboardingStatus
 import org.jcastillo.grabaciones.services.callDetection.CallDetectionMode
 import org.jcastillo.grabaciones.system.permissions.PermissionChecks
 import org.jcastillo.grabaciones.ui.screens.DisclaimerScreen
+import org.jcastillo.grabaciones.ui.screens.MegaBackupSettingsSection
 import org.jcastillo.grabaciones.ui.screens.PermissionsScreen
 import org.jcastillo.grabaciones.ui.theme.GrabacionesLocalesTheme
 import org.jcastillo.grabaciones.ui.viewmodels.AppNavigationViewModel
@@ -436,6 +437,8 @@ private fun SettingsScreen(preferences: AppPreferences, onBack: () -> Unit) {
                 }
             }
 
+            MegaBackupSettingsSection()
+
             Text("Captura de audio", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text("Siempre MP3 mono, 64 kbps. No se recurre al micrófono si falla una de las dos rutas.", style = MaterialTheme.typography.bodySmall)
             SourceOption(
@@ -528,7 +531,7 @@ private fun SettingsScreen(preferences: AppPreferences, onBack: () -> Unit) {
                     TextButton(onClick = { openLicense("Licencia de LAME (LGPL-2.0)", "LAME-LGPL-2.0.txt") }) {
                         Text("Leer licencia de LAME")
                     }
-                    Text("Sin cuentas, anuncios ni telemetría. La red se usa solo para emparejar y conectar ADB localmente; el permiso de Internet es necesario para ese transporte.", style = MaterialTheme.typography.bodySmall)
+                    Text("No hay cuenta propia de la app ni telemetría. La red se usa para ADB local y, solo si conectas MEGA y activas el respaldo, para subir MP3 a tu cuenta. No se generan enlaces públicos.", style = MaterialTheme.typography.bodySmall)
                 }
             }
             Text("Las llamadas en espera, conferencias y cambios entre llamadas simultáneas pueden no separarse correctamente. Comprueba la grabación en cada dispositivo.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)

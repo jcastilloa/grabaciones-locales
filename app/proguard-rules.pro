@@ -23,6 +23,11 @@
 # Prevent code obfuscation to keep the original class, method, and field names.
 -dontobfuscate
 
+# Keep JNI entry points and SWIG callback classes used by the official MEGA SDK.
+-keep class nz.mega.sdk.** { *; }
+-keepclasseswithmembernames class * { native <methods>; }
+-keep class org.jcastillo.grabaciones.integrations.mega.MegaUploadWorker { public <init>(android.content.Context, androidx.work.WorkerParameters); *; }
+
 # Keep JNI method names used from the native LAME bridge.
 -keep class org.jcastillo.grabaciones.audio.LameMp3Encoder { *; }
 

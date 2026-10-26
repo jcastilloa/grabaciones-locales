@@ -1,0 +1,508 @@
+package nz.mega.sdk;
+
+import android.content.ContentResolver;
+import android.content.Context;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Matrix;
+import android.graphics.Rect;
+import android.media.MediaMetadataRetriever;
+import android.media.ThumbnailUtils;
+import android.net.Uri;
+import android.os.Build;
+import android.provider.BaseColumns;
+import android.provider.MediaStore;
+import android.util.Size;
+
+import androidx.exifinterface.media.ExifInterface;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URLConnection;
+import java.util.Objects;
+
+public class AndroidGfxProcessor extends MegaGfxProcessor {
+    Rect size;
+    int orientation;
+    String srcPath;
+    boolean isVideo;
+    Bitmap bitmap;
+    byte[] bitmapData;
+    static Context context = null;
+
+    protected AndroidGfxProcessor() {
+        if (context == null) {
+            try {
+                context = (Context) Class.forName("android.app.AppGlobals")
+                        .getMethod("getInitialApplication")
+                        .invoke(null, (Object[]) null);
+            } catch (Exception e) {
+            }
+        }
+    }
+
+    // Return file extensions for all supported formats: images,videos,pdf and etc, must end with .
+    public String supportedImageFormats() {
+        return ".jpg.png.bmp.jpeg.cut.dds.g3.gif.hdr.ico.iff.ilbm" +
+                ".jbig.jng.jif.koala.pcd.mng.pcx.pbm.pgm.ppm.pfm.pds.raw.3fr.ari" +
+                ".arw.bay.crw.cr2.cap.dcs.dcr.dng.drf.eip.erf.fff.iiq.k25.kdc.mdc.mef.mos.mrw" +
+                ".nef.nrw.obm.orf.pef.ptx.pxn.r3d.raf.raw.rwl.rw2.rwz.sr2.srf.srw.x3f.ras.tga" +
+                ".xbm.xpm.jp2.j2k.jpf.jpx.webp" +
+                ".cur.heic.jc2.pnm.psd.tif.tiff.3g2.3gp.avi.m4v.mov.mp4.mqv.qt.jxl.avif.pdf.";
+    }
+
+    // Return null to skip extra checking
+    public String supportedVideoFormats() {
+        return null;
+    }
+
+    private static boolean isVideoFile(String path) { return isVideoFile(null, path); }
+
+    // name is the conceptual name the file will have in the cloud; it may differ from the
+    // file name in path and is only used as a fallback when path yields no MIME type.
+    private static boolean isVideoFile(String name, String path) {
+        String mimeType = getMimeType(path);
+        if (mimeType == null && name != null) {
+            mimeType = URLConnection.guessContentTypeFromName(name);
+        }
+        return mimeType != null && mimeType.startsWith("video");
+    }
+
+    private static String getMimeType(String path) {
+        try {
+            String mimeType = URLConnection.guessContentTypeFromName(path);
+            if (mimeType == null) {
+                Uri uri = Uri.parse(path);
+                mimeType = context.getContentResolver().getType(uri);
+            }
+            return mimeType;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public static Rect getImageDimensions(String path, int orientation) {
+        return getImageDimensions(path, orientation, isVideoFile(path));
+    }
+
+    public static Rect getImageDimensions(String path, int orientation, boolean isVideo) {
+        Rect rect = new Rect();
+
+        if (isVideo) {
+            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+
+            try {
+                setMediaMetadataRetrieverDataSource(retriever, path);
+                int width;
+                int height;
+                int interchangeOrientation = Integer.parseInt(Objects.<String>requireNonNull(
+                        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)));
+                if (interchangeOrientation == 90 || interchangeOrientation == 270) {
+                    width = Integer.parseInt(Objects.<String>requireNonNull(retriever.extractMetadata(
+                            MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)));
+                    height = Integer.parseInt(Objects.<String>requireNonNull(retriever.extractMetadata(
+                            MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)));
+                } else {
+                    width = Integer.parseInt(Objects.<String>requireNonNull(retriever.extractMetadata(
+                            MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)));
+                    height = Integer.parseInt(Objects.<String>requireNonNull(retriever.extractMetadata(
+                            MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)));
+                }
+
+                rect.right = width;
+                rect.bottom = height;
+            } catch (Exception e) {
+                System.out.println("Error in getImageDimensions for video: " + e);
+            } finally {
+                try {
+                    retriever.release();
+                } catch (IOException e) {
+                    System.out.println("Error releasing MediaMetadataRetriever for video: " + e);
+                }
+            }
+        } else {
+            try {
+                BitmapFactory.Options options = new BitmapFactory.Options();
+                options.inJustDecodeBounds = true;
+                InputStream inputStream = getInputStreamFromPath(path);
+                BitmapFactory.decodeStream(inputStream, null, options);
+
+                if ((options.outWidth > 0) && (options.outHeight > 0)) {
+                    if ((orientation < 5) || (orientation > 8)) {
+                        rect.right = options.outWidth;
+                        rect.bottom = options.outHeight;
+                    } else {
+                        rect.bottom = options.outWidth;
+                        rect.right = options.outHeight;
+                    }
+                }
+            } catch (Exception e) {
+            }
+        }
+
+        return rect;
+    }
+
+    private static InputStream getInputStreamFromPath(String path) {
+        try {
+            Uri uri = Uri.parse(path);
+            String scheme = uri == null ? null : uri.getScheme();
+
+            if (scheme != null) {
+                return context.getContentResolver().openInputStream(uri);
+            } else {
+                return new FileInputStream(path);
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static void setMediaMetadataRetrieverDataSource(MediaMetadataRetriever retriever,
+                                                            String path) {
+        Uri uri = Uri.parse(path);
+        String scheme = uri == null ? null : uri.getScheme();
+        if (scheme != null) {
+            retriever.setDataSource(context, uri);
+        } else {
+            retriever.setDataSource(path);
+        }
+    }
+
+    public boolean readBitmap(String name, String path) {
+        try {
+            isVideo = isVideoFile(name, path);
+            if (isVideo) {
+                srcPath = path;
+                size = getImageDimensions(srcPath, orientation, isVideo);
+                return (size.right != 0) && (size.bottom != 0);
+            } else {
+                srcPath = path;
+                orientation = getExifOrientation(path);
+                size = getImageDimensions(srcPath, orientation, isVideo);
+                return (size.right != 0) && (size.bottom != 0);
+            }
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    public int getWidth() {
+        return size.right;
+    }
+
+    public int getHeight() {
+        return size.bottom;
+    }
+
+    private static boolean isContentUri(Uri uri) {
+        String scheme = uri == null ? null : uri.getScheme();
+        return scheme != null && scheme.equals("content");
+    }
+
+    /**
+     * Load a thumbnail via {@link ContentResolver#loadThumbnail(Uri, Size, CancellationSignal)}
+     * for {@code content://} URIs (API 29+). Returns pre-cached MediaStore thumbnails when
+     * available, avoiding a full decode. Returns null if unavailable or unsupported.
+     */
+    private static Bitmap loadThumbnail(Uri uri, int targetW, int targetH) {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || context == null) {
+                return null;
+            }
+
+            int hintW = Math.max(targetW, 100);
+            int hintH = Math.max(targetH, 100);
+            return context.getContentResolver().loadThumbnail(uri, new Size(hintW, hintH), null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Decode a thumbnail via {@link BitmapFactory} with subsampling, EXIF correction, and scaling.
+     */
+    private static Bitmap decodeThumbnail(String path, Rect rect, int orientation,
+                                          int w, int h) {
+        int width;
+        int height;
+        if ((orientation < 5) || (orientation > 8)) {
+            width = rect.right;
+            height = rect.bottom;
+        } else {
+            width = rect.bottom;
+            height = rect.right;
+        }
+
+        try {
+            int scale = 1;
+            while (width / scale / 2 >= w && height / scale / 2 >= h) {
+                scale *= 2;
+            }
+
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inJustDecodeBounds = false;
+            options.inSampleSize = scale;
+            InputStream inputStream = getInputStreamFromPath(path);
+            Bitmap tmp = BitmapFactory.decodeStream(inputStream, null, options);
+            tmp = fixExifOrientation(tmp, orientation);
+            return Bitmap.createScaledBitmap(tmp, w, h, true);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    static public Bitmap getBitmap(String path, Rect rect, int orientation, int w, int h) {
+        return getBitmap(path, rect, orientation, w, h, isVideoFile(path));
+    }
+
+    static public Bitmap getBitmap(String path, Rect rect, int orientation, int w, int h,
+                                   boolean isVideo) {
+        if (path == null) {
+            return null;
+        }
+
+        if (isVideo) {
+            Uri uri = Uri.parse(path);
+            boolean contentUri = isContentUri(uri);
+
+            Bitmap bmThumbnail = null;
+            Cursor cursor = null;
+
+            if (contentUri) {
+                bmThumbnail = loadThumbnail(uri, w, h);
+            } else {
+                try {
+                    bmThumbnail = ThumbnailUtils.createVideoThumbnail(
+                            path, MediaStore.Video.Thumbnails.FULL_SCREEN_KIND);
+                    if (context != null && bmThumbnail == null) {
+
+                        String SELECTION = MediaStore.MediaColumns.DATA + "=?";
+                        String[] PROJECTION = {BaseColumns._ID};
+
+                        uri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI;
+                        String[] selectionArgs = {path};
+                        ContentResolver cr = context.getContentResolver();
+                        cursor = cr.query(uri, PROJECTION, SELECTION, selectionArgs, null);
+                        if (cursor != null && cursor.moveToFirst()) {
+                            long videoId = cursor.getLong(0);
+                            bmThumbnail = MediaStore.Video.Thumbnails.getThumbnail(
+                                    cr, videoId, MediaStore.Video.Thumbnails.FULL_SCREEN_KIND, null);
+                        }
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                } finally {
+                    if (cursor != null) {
+                        cursor.close();
+                    }
+                }
+            }
+
+            if (bmThumbnail == null) {
+
+                MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+                try {
+                    setMediaMetadataRetrieverDataSource(retriever, path);
+                    bmThumbnail = retriever.getFrameAtTime();
+                } catch (Exception e1) {
+                    e1.printStackTrace();
+                } finally {
+                    try {
+                        retriever.release();
+                    } catch (Exception ex) {
+                        ex.printStackTrace();
+                    }
+                }
+            }
+
+            if (!contentUri && bmThumbnail == null) {
+                try {
+                    bmThumbnail = ThumbnailUtils.createVideoThumbnail(path, MediaStore.Video.Thumbnails.MINI_KIND);
+                    if (context != null && bmThumbnail == null) {
+
+                        String SELECTION = MediaStore.MediaColumns.DATA + "=?";
+                        String[] PROJECTION = {BaseColumns._ID};
+
+                        uri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI;
+                        String[] selectionArgs = {path};
+                        ContentResolver cr = context.getContentResolver();
+                        cursor = cr.query(uri, PROJECTION, SELECTION, selectionArgs, null);
+                        if (cursor != null && cursor.moveToFirst()) {
+                            long videoId = cursor.getLong(0);
+                            bmThumbnail = MediaStore.Video.Thumbnails.getThumbnail(cr, videoId, MediaStore.Video.Thumbnails.MINI_KIND, null);
+                        }
+                    }
+                } catch (Exception e2) {
+                    e2.printStackTrace();
+                } finally {
+                    if (cursor != null) {
+                        cursor.close();
+                    }
+                }
+            }
+
+            try {
+                if (bmThumbnail != null) {
+                    return Bitmap.createScaledBitmap(bmThumbnail, w, h, true);
+                }
+            } catch (Exception e) {
+            }
+        } else {
+            Uri uri = Uri.parse(path);
+            if (isContentUri(uri)) {
+                Bitmap thumbnail = loadThumbnail(uri, w, h);
+                if (thumbnail != null) {
+                    try {
+                        return Bitmap.createScaledBitmap(thumbnail, w, h, true);
+                    } catch (Exception e) {
+                    }
+                }
+            }
+
+            // Fallback
+            return decodeThumbnail(path, rect, orientation, w, h);
+        }
+
+        return null;
+    }
+
+    public static int getExifOrientation(String srcPath) {
+        InputStream inputStream = getInputStreamFromPath(srcPath);
+        if (inputStream == null) {
+            return ExifInterface.ORIENTATION_UNDEFINED;
+        }
+
+        try (inputStream) {
+            ExifInterface exif = new ExifInterface(inputStream);
+            return exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED);
+        } catch (IOException e) {
+            return ExifInterface.ORIENTATION_UNDEFINED;
+        }
+    }
+
+    /*
+     * Change image orientation based on EXIF image data
+     */
+    public static Bitmap fixExifOrientation(Bitmap bitmap, int orientation) {
+        if (bitmap == null)
+            return null;
+
+        if ((orientation < 2) || (orientation > 8)) {
+            // No changes required or invalid orientation
+            return bitmap;
+        }
+
+        Matrix matrix = new Matrix();
+        switch (orientation) {
+            case ExifInterface.ORIENTATION_TRANSPOSE:
+            case ExifInterface.ORIENTATION_ROTATE_90:
+                matrix.postRotate(90);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_180:
+            case ExifInterface.ORIENTATION_FLIP_VERTICAL:
+                matrix.postRotate(180);
+                break;
+            case ExifInterface.ORIENTATION_TRANSVERSE:
+            case ExifInterface.ORIENTATION_ROTATE_270:
+                matrix.postRotate(270);
+                break;
+            default:
+                break;
+        }
+
+        if ((orientation == ExifInterface.ORIENTATION_FLIP_HORIZONTAL)
+                || (orientation == ExifInterface.ORIENTATION_FLIP_VERTICAL))
+            matrix.preScale(-1, 1);
+        else if ((orientation == ExifInterface.ORIENTATION_TRANSPOSE)
+                || (orientation == ExifInterface.ORIENTATION_TRANSVERSE))
+            matrix.preScale(1, -1);
+
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+    }
+
+    public static Bitmap extractRect(Bitmap bitmap, int px, int py, int rw, int rh) {
+        if (bitmap == null)
+            return null;
+
+        int w = bitmap.getWidth();
+        int h = bitmap.getHeight();
+        if ((px != 0) || (py != 0) || (rw != w) || (rh != h)) {
+            Bitmap.Config conf = Bitmap.Config.ARGB_8888;
+            Bitmap scaled = Bitmap.createBitmap(rw, rh, conf);
+            Canvas canvas = new Canvas(scaled);
+            canvas.drawBitmap(bitmap, new Rect(px, py, px + rw, py + rh), new Rect(0, 0, rw, rh), null);
+            bitmap = scaled;
+        }
+        return bitmap;
+    }
+
+    public static boolean saveBitmap(Bitmap bitmap, File file) {
+        if (bitmap == null)
+            return false;
+
+        try (FileOutputStream stream = new FileOutputStream(file)) {
+            return bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return false;
+    }
+
+    public int getBitmapDataSize(int w, int h, int px, int py, int rw, int rh, int hint) {
+        try {
+            if (bitmap == null)
+                bitmap = getBitmap(srcPath, size, orientation, w, h, isVideo);
+            else
+                bitmap = Bitmap.createScaledBitmap(bitmap, w, h, true);
+
+            bitmap = extractRect(bitmap, px, py, rw, rh);
+            if (bitmap == null)
+                return 0;
+
+            Bitmap.CompressFormat targetFormat = Bitmap.CompressFormat.JPEG;
+            int targetQuality = 85;
+            if (hint == MegaGfxProcessor.GFX_HINT_FORMAT_PNG) {
+                boolean hasTransparency = bitmap.hasAlpha();
+                if (hasTransparency) {
+                    targetFormat = Bitmap.CompressFormat.PNG;
+                    targetQuality = 75;
+                }
+            }
+
+            ByteArrayOutputStream stream = new ByteArrayOutputStream();
+            if (!bitmap.compress(targetFormat, targetQuality, stream))
+                return 0;
+
+            bitmapData = stream.toByteArray();
+            return bitmapData.length;
+        } catch (Throwable e) {
+        }
+        return 0;
+    }
+
+    public boolean getBitmapData(byte[] buffer) {
+        try {
+            System.arraycopy(bitmapData, 0, buffer, 0, bitmapData.length);
+            return true;
+        } catch (Exception e) {
+        }
+        return false;
+    }
+
+    public void freeBitmap() {
+        bitmap = null;
+        bitmapData = null;
+        size = null;
+        srcPath = null;
+        orientation = 0;
+        isVideo = false;
+    }
+}

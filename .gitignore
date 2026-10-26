@@ -20,7 +20,7 @@ captures/
 .cxx/
 *.aab
 *.apk
-!dist/GrabacionesLocales-1.0.0.apk
+!dist/*.apk
 output-metadata.json
 app/release/*
 

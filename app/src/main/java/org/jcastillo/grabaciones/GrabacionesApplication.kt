@@ -10,6 +10,7 @@ package org.jcastillo.grabaciones
 
 import android.app.Application
 import org.jcastillo.grabaciones.services.callDetection.CallDetectionOrchestrator
+import org.jcastillo.grabaciones.integrations.mega.MegaBackupScheduler
 import org.jcastillo.grabaciones.utils.AppLogger
 import org.jcastillo.grabaciones.data.recording.LocalRecordingRepository
 import kotlinx.coroutines.CoroutineScope
@@ -29,6 +30,8 @@ class GrabacionesApplication : Application() {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             runCatching { LocalRecordingRepository(applicationContext).recoverPending() }
                 .onFailure { AppLogger.e("Could not recover an earlier WAV intermediate", it) }
+            runCatching { MegaBackupScheduler.schedulePending(applicationContext) }
+                .onFailure { AppLogger.e("Could not resume pending MEGA backups", it) }
         }
     }
 }

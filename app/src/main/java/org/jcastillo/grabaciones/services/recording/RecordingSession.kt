@@ -14,6 +14,7 @@ import org.jcastillo.grabaciones.data.call.EnrichedCallData
 import org.jcastillo.grabaciones.data.recording.LocalRecordingRepository
 import org.jcastillo.grabaciones.data.recording.RecordingFailure
 import org.jcastillo.grabaciones.data.recording.RecordingPlan
+import org.jcastillo.grabaciones.integrations.mega.MegaBackupScheduler
 import org.jcastillo.grabaciones.utils.AppLogger
 import java.io.File
 
@@ -117,6 +118,18 @@ class RecordingSession(
             .getOrNull()
         currentRecordingUri = result
         finalizationSucceeded = result != null
+        if (result != null) {
+            runCatching {
+                MegaBackupScheduler.registerRecording(
+                    context.applicationContext,
+                    result,
+                    "${wavFile.nameWithoutExtension}.mp3",
+                )
+            }.onFailure {
+                // A cloud-queue failure never changes the already verified local recording result.
+                AppLogger.e("Could not add the completed MP3 to the MEGA backup queue", it)
+            }
+        }
         if (!finalizationSucceeded) {
             AppLogger.e("MP3 finalization did not complete. Preserving private intermediate at ${wavFile.absolutePath}")
         }

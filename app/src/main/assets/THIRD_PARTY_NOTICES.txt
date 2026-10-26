@@ -26,6 +26,13 @@ The embedded-ADB architecture, mDNS endpoint handling, and foreground pairing no
 
 [LAME 3.100](https://sourceforge.net/projects/lame/files/lame/3.100/) is bundled as a shared library under LGPL-2.0-or-later. License text is in `licenses/LAME-LGPL-2.0.txt` and app assets.
 
+## MEGA SDK and Android bindings
+
+- [MEGA SDK](https://github.com/meganz/sdk), release **v10.21.0** (`d1c0cb76cb98598d93b9fb0bb89612daeb0fb39c`), is bundled as the official Java/JNI bindings and native `libmega.so` libraries for Android ABIs. The SDK is licensed under BSD-2-Clause; full text: `licenses/MEGA-SDK-BSD-2-Clause.txt`.
+- The Android bindings are generated from the official SDK sources with SWIG 4.0.2. Source files and corresponding native libraries are under `app/src/main/java/nz/mega/sdk/` and `app/src/main/jniLibs/`.
+- Static native dependencies bundled by the SDK build include Crypto++, curl, ICU, MediaInfo/libzen, libsodium, libuv, OpenSSL, SQLite, tinyxml2, zlib, and zstd. Their upstream copyright and license notices are retained in `licenses/MEGA-*-NOTICE.txt` and the in-app third-party notices.
+- MEGA SDK v10.21.0 no longer requires an application key. The Java binding passes `null` to the native constructor when no key is used; see the maintainer confirmation in meganz/sdk#2706: https://github.com/meganz/sdk/issues/2706#issuecomment-2850231304.
+
 ## AndroidX
 
 AndroidX and Jetpack Compose dependencies are provided under Apache-2.0; see the corresponding Google Maven artifacts and their notices.
