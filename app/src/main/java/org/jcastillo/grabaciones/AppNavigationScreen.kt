@@ -445,7 +445,7 @@ private fun SettingsScreen(preferences: AppPreferences, onBack: () -> Unit) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Grabación sin Wi-Fi", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "Arma una vez un transporte ADB local autenticado por RSA. Después de inicializarlo con Wi-Fi, las llamadas usan el Binder del servicio y pueden grabarse con datos móviles o sin red.",
+                        "Arma una vez un transporte ADB clásico autenticado por RSA. Android puede publicarlo en todas las interfaces de red, no solo en 127.0.0.1; actívalo únicamente si aceptas esa exposición. Después de inicializarlo con Wi-Fi, las llamadas pueden grabarse con datos móviles o sin red.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -457,9 +457,15 @@ private fun SettingsScreen(preferences: AppPreferences, onBack: () -> Unit) {
                                 if (!enabled) {
                                     offlineBusy = true
                                     settingsScope.launch {
-                                        withContext(Dispatchers.IO) { EmbeddedAdbManager.disableOfflineRecording(context) }
-                                        offlineRecording = false
+                                        val result = withContext(Dispatchers.IO) {
+                                            runCatching { EmbeddedAdbManager.disableOfflineRecording(context) }
+                                        }
                                         offlineBusy = false
+                                        if (result.isSuccess) {
+                                            offlineRecording = false
+                                        } else {
+                                            Toast.makeText(context, "No se puede cambiar durante una grabación: ${result.exceptionOrNull()?.localizedMessage}", Toast.LENGTH_LONG).show()
+                                        }
                                     }
                                 } else {
                                     offlineBusy = true
@@ -481,7 +487,7 @@ private fun SettingsScreen(preferences: AppPreferences, onBack: () -> Unit) {
                         )
                     }
                     Text(
-                        "Es una opción de CallVault 1.4.0. Abre un puerto tcpip local protegido por la clave ADB; desactívala si no aceptas esa superficie adicional. Tras reiniciar, debe rearmarse con Wi-Fi.",
+                        "Abre un puerto tcpip protegido por la clave ADB que puede quedar accesible desde la red local. Desactívala cuando no la necesites; el cierre es best-effort. Tras reiniciar, el modo tcpip se pierde y debe rearmarse con Wi-Fi.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

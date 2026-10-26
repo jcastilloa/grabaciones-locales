@@ -19,6 +19,7 @@ import org.jcastillo.grabaciones.data.AppPreferences
 import org.jcastillo.grabaciones.data.call.CallDirection
 import org.jcastillo.grabaciones.data.call.RawCallData
 import org.jcastillo.grabaciones.services.RecordingDecisionEngine
+import org.jcastillo.grabaciones.integrations.adb.EmbeddedAdbManager
 import org.jcastillo.grabaciones.utils.AppLogger
 import org.jcastillo.grabaciones.utils.PhoneNumberManager
 import kotlinx.coroutines.CoroutineScope
@@ -55,6 +56,9 @@ class InCallService : InCallService() {
     private var activeTrackedCall: Call? = null
     /** Flag to ensure the [RecordingDecisionEngine] pipeline is only executed once per call session.*/
     private var isPipelineExecuted = false
+    /** The prewarm already started the foreground service even if the call never became ACTIVE. */
+    private var isPrewarmStarted = false
+    private var callGeneration = 0L
 
     // Callback reference used to safely manage the listener lifespan
     private val callCallback = object : Call.Callback() {
@@ -84,6 +88,7 @@ class InCallService : InCallService() {
         }
 
         // Assign and register tracking handles
+        val generation = ++callGeneration
         activeTrackedCall = call
         call.registerCallback(callCallback)
         AppLogger.i( "[TIMING] call-detected ${SystemClock.elapsedRealtime()}ms state=${callStateToString(call.details.state)}")
@@ -92,10 +97,15 @@ class InCallService : InCallService() {
         // Start the foreground service in standby as soon as Telecom gives us a ringing/dialing
         // call. This warms the privileged daemon before ACTIVE, without recording early audio.
         if (call.details.state != Call.STATE_ACTIVE) {
+            isPrewarmStarted = true
+            EmbeddedAdbManager.markCaptureStarting()
             serviceScope.launch {
+                if (generation != callGeneration) return@launch
                 val raw = rawCallData(call)
                 AppLogger.i("[TIMING] prewarm-request ${SystemClock.elapsedRealtime()}ms")
-                RecordingDecisionEngine.getInstance(this@InCallService).prepareRecording(raw)
+                if (generation == callGeneration) {
+                    RecordingDecisionEngine.getInstance(this@InCallService).prepareRecording(raw)
+                }
             }
         }
 
@@ -208,11 +218,16 @@ class InCallService : InCallService() {
         // Sever the listener relation to prevent framework memory leaks
         trackedCall.unregisterCallback(callCallback)
 
-        // If an intent (Record or Standby) was successfully pushed to the FGS, we must shut it down
-        if (isPipelineExecuted) {
+        callGeneration++
+        // The prewarm also starts a foreground service. Stop it when a call ends before ACTIVE;
+        // otherwise unanswered/rejected calls leave a permanent standby notification behind.
+        if (isPipelineExecuted || isPrewarmStarted) {
             RecordingDecisionEngine.getInstance(this).endRecordingSession()
-            isPipelineExecuted = false
         }
+        val hadActivePipeline = isPipelineExecuted
+        isPipelineExecuted = false
+        isPrewarmStarted = false
+        if (!hadActivePipeline) EmbeddedAdbManager.markCaptureFinished()
 
         // Flush the object reference to fully accept new calls down the road
         activeTrackedCall = null

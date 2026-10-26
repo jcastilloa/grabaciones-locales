@@ -27,6 +27,7 @@ import org.jcastillo.grabaciones.integrations.adb.EmbeddedAdbManager
 import org.jcastillo.grabaciones.utils.AppLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -83,6 +84,8 @@ class RecordingForegroundService : Service() {
     private var shellService: IShellService? = null
     private var recordingWakeLock: PowerManager.WakeLock? = null
     private var finalizationInProgress = false
+    private var startJob: Job? = null
+    private var startGeneration = 0L
 
     /** Scope for service lifecycle operations (binding, etc.) */
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -175,8 +178,8 @@ class RecordingForegroundService : Service() {
 
         when (action) {
             ACTION_START_RECORDING, ACTION_MANUAL_START -> {
-                if (state.isRecordingActive) {
-                    AppLogger.w( "Start request ignored. A session is already on-going.")
+                if (state.isRecordingActive || state.isStarting || finalizationInProgress) {
+                    AppLogger.w( "Start request ignored. A session is already starting, active, or finalizing.")
                     return START_NOT_STICKY
                 }
 
@@ -188,18 +191,23 @@ class RecordingForegroundService : Service() {
                     return START_NOT_STICKY // We won't reach this anyway.
                 }
 
+                val generation = ++startGeneration
+                EmbeddedAdbManager.markCaptureStarting()
                 _serviceState.update { RecordingServiceState.Starting(currentMeta) }
                 acquireRecordingWakeLock()
 
-                serviceScope.launch {
+                startJob = serviceScope.launch {
                     try {
                         val service = EmbeddedAdbManager.getShellService(this@RecordingForegroundService)
+                        if (generation != startGeneration) return@launch
                         AppLogger.i("[TIMING] privileged-service-ready ${SystemClock.elapsedRealtime()}ms")
                         shellService = service
                         if (!service.canCaptureAudioOutput()) {
                             throw SecurityException("Android no concedió CAPTURE_AUDIO_OUTPUT al proceso shell.")
                         }
-                        startNewRecordingSession(service, currentMeta)
+                        if (generation == startGeneration) {
+                            startNewRecordingSession(service, currentMeta, generation)
+                        }
                     } catch (e: Exception) {
                         // Don't convert coroutine cancellation into a user-visible service failure.
                         if (e is CancellationException) throw e
@@ -207,21 +215,29 @@ class RecordingForegroundService : Service() {
                         notificationHelper.showErrorNotification(
                             getString(R.string.recording_adb_not_started) + "\n" + (e.localizedMessage ?: "")
                         )
-                        stopRecordingSessionAndService()
+                        stopRecordingSessionAndService(startId)
                     } finally {
-                        _serviceState.update { currentState ->
-                            // If we failed to start the recording session, we should return to standby state with the current metadata.
-                            if (currentState is RecordingServiceState.Starting) {
-                                RecordingServiceState.Standby(currentMeta)
-                            } else {
-                                currentState
+                        if (generation == startGeneration) {
+                            _serviceState.update { currentState ->
+                                // If we failed to start the recording session, return to standby.
+                                if (currentState is RecordingServiceState.Starting) {
+                                    EmbeddedAdbManager.markCaptureFinished()
+                                    RecordingServiceState.Standby(currentMeta)
+                                } else {
+                                    currentState
+                                }
                             }
                         }
+                        if (startJob?.isCompleted == true) startJob = null
                     }
                 }
             }
 
             ACTION_STANDBY -> {
+                if (state.isRecordingActive || state.isStarting || finalizationInProgress) {
+                    AppLogger.d("Ignoring standby request while a recording command is already in progress")
+                    return START_NOT_STICKY
+                }
                 _serviceState.update { RecordingServiceState.Standby(currentMeta) }
                 serviceScope.launch {
                     runCatching { EmbeddedAdbManager.getShellService(this@RecordingForegroundService) }
@@ -255,7 +271,12 @@ class RecordingForegroundService : Service() {
                 }
             }
 
-            ACTION_STOP_RECORDING -> stopRecordingSessionAndService()
+            ACTION_STOP_RECORDING -> {
+                startGeneration++
+                startJob?.cancel()
+                startJob = null
+                stopRecordingSessionAndService(startId)
+            }
             ACTION_NOTIFICATION_DISMISSED -> {
                 AppLogger.d( "Ongoing foreground service notification dismissed by user (Android 14+), reposting.")
                 updateNotification()
@@ -265,6 +286,10 @@ class RecordingForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        startGeneration++
+        startJob?.cancel()
+        startJob = null
+        // Keep transport changes blocked until any active remote session has been released below.
         // Always clean up, even if the OS kills the service mid-recording.
         // This is the guaranteed last callback before the service process is cleaned up.
         AppLogger.v( "RecordingForegroundService is destroying... Ensuring cleanup...")
@@ -279,6 +304,7 @@ class RecordingForegroundService : Service() {
         overlayController.hideOverlay()
         releaseRecordingWakeLock()
         EmbeddedAdbManager.removeServiceLostListener(adbServiceLostListener)
+        EmbeddedAdbManager.markCaptureFinished()
         super.onDestroy()
     }
 
@@ -292,8 +318,8 @@ class RecordingForegroundService : Service() {
      * @param service The [IShellService] instance to use for recording.
      * @param metadata The [EnrichedCallData] containing call information for the recording session.
      */
-    private fun startNewRecordingSession(service: IShellService, metadata: EnrichedCallData) {
-        if (_serviceState.value.isRecordingActive) {
+    private fun startNewRecordingSession(service: IShellService, metadata: EnrichedCallData, generation: Long) {
+        if (generation != startGeneration || _serviceState.value.isRecordingActive || finalizationInProgress) {
             AppLogger.w("startNewRecordingSession() called while a session is already active – ignoring")
             return
         }
@@ -327,6 +353,11 @@ class RecordingForegroundService : Service() {
             return
         }
 
+        if (generation != startGeneration) {
+            activeSession.cancel()
+            return
+        }
+
         _serviceState.update {
             RecordingServiceState.Active(
                 session = activeSession,
@@ -342,14 +373,16 @@ class RecordingForegroundService : Service() {
     /**
      * Stops the current recording session (if any) and stops the foreground service.
      */
-    private fun stopRecordingSessionAndService() {
+    private fun stopRecordingSessionAndService(stopStartId: Int = 0) {
         val activeSession = (_serviceState.value as? RecordingServiceState.Active)?.session
 
         if (activeSession == null) {
             AppLogger.d("No active session, exiting standby state, removing foreground notification and stopping service.")
+            EmbeddedAdbManager.markCaptureFinished()
+            _serviceState.update { RecordingServiceState.Standby(null) }
             releaseRecordingWakeLock()
             stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            if (stopStartId > 0) stopSelfResult(stopStartId) else stopSelf()
             return
         }
         if (finalizationInProgress) {
@@ -380,11 +413,17 @@ class RecordingForegroundService : Service() {
             }
 
             finalizationInProgress = false
+            EmbeddedAdbManager.markCaptureFinished()
             releaseRecordingWakeLock()
-            _serviceState.update { RecordingServiceState.Standby(null) }
-            AppLogger.i("Recording session stopped and resources released. Stopping foreground service.")
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            val isStillThisSession = (_serviceState.value as? RecordingServiceState.Active)?.session === activeSession
+            if (isStillThisSession) {
+                _serviceState.update { RecordingServiceState.Standby(null) }
+                AppLogger.i("Recording session stopped and resources released. Stopping foreground service.")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                if (stopStartId > 0) stopSelfResult(stopStartId) else stopSelf()
+            } else {
+                AppLogger.w("A newer recording command replaced the finalized session; leaving the foreground service alive")
+            }
         }
     }
 

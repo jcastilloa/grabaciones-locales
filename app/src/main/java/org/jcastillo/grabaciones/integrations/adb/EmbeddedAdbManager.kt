@@ -20,19 +20,32 @@ import org.jcastillo.grabaciones.IShellService
 import org.jcastillo.grabaciones.data.AppPreferences
 import org.jcastillo.grabaciones.server.EmbeddedAdbBinderProvider
 import org.jcastillo.grabaciones.utils.AppLogger
+import io.github.muntashirakon.adb.AdbStream
 import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /** Owns the persisted wireless-ADB identity, shell connection and recorder Binder lifecycle. */
 object EmbeddedAdbManager {
     private const val TAG = "GL:EmbeddedAdb"
     private const val CONNECT_DISCOVERY_TIMEOUT_MS = 12_000L
+    private const val CONNECT_HANDSHAKE_TIMEOUT_MS = 8_000L
     private const val BINDER_WAIT_TIMEOUT_MS = 18_000L
+    private const val LOOPBACK_RECOVERY_TIMEOUT_MS = 12_000L
+    private const val LOOPBACK_RETRY_INTERVAL_MS = 750L
+    private const val ADB_READ_TIMEOUT_MS = 2_000L
+    private const val DISCONNECT_TIMEOUT_MS = 2_000L
+    private const val LAUNCH_DRAIN_TIMEOUT_MS = 4_000L
     private const val DAEMON_CLASS = "org.jcastillo.grabaciones.services.daemon.EmbeddedRecorderDaemon"
     private const val SERVICE_LOST_ERROR = "Se perdió el servicio ADB integrado. Comprueba la depuración inalámbrica y vuelve a emparejar si hace falta."
 
     private val launchMutex = Mutex()
+    private val binderLock = Any()
     private val serviceLostListeners = CopyOnWriteArrayList<() -> Unit>()
+
+    @Volatile
+    private var captureInProgress = false
 
     @Volatile
     private var shellService: IShellService? = null
@@ -40,9 +53,29 @@ object EmbeddedAdbManager {
     @Volatile
     private var linkedBinder: IBinder? = null
 
+    @Volatile
+    private var linkedDeathRecipient: IBinder.DeathRecipient? = null
+
     fun isPaired(context: Context): Boolean = AppPreferences(context).isAdbPaired()
 
     fun isRecorderConnected(): Boolean = shellService?.asBinder()?.isBinderAlive == true
+
+    /** Settings must not restart adbd while a remote capture is active or being started. */
+    fun markCaptureStarting() {
+        captureInProgress = true
+    }
+
+    fun markCaptureFinished() {
+        captureInProgress = false
+    }
+
+    fun isCaptureInProgress(): Boolean = captureInProgress
+
+    private fun checkTransportChangeAllowed() {
+        if (captureInProgress) {
+            throw IllegalStateException("No se puede cambiar el transporte ADB mientras una grabación está iniciándose o activa.")
+        }
+    }
 
     fun addServiceLostListener(listener: () -> Unit) {
         serviceLostListeners += listener
@@ -68,8 +101,9 @@ object EmbeddedAdbManager {
      * bootstrap or recover that daemon; recording commands themselves use Binder.
      *
      * When off-Wi-Fi recording is enabled, the first setup arms CallVault's classic-tcpip
-     * loopback listener once over Wireless debugging. Later calls use 127.0.0.1 and never run
-     * mDNS discovery, so losing Wi-Fi is not treated as losing the recorder.
+     * classic-tcpip listener once over Wireless debugging. Later calls dial it through 127.0.0.1
+     * and never run mDNS discovery, so losing Wi-Fi is not treated as losing the recorder. The
+     * tcpip listener may still be published on non-loopback interfaces by adbd.
      */
     suspend fun getShellService(context: Context): IShellService = withContext(Dispatchers.IO) {
         shellService?.takeIf { it.asBinder().isBinderAlive }?.let {
@@ -102,7 +136,7 @@ object EmbeddedAdbManager {
                     // launched only after reconnecting through loopback; otherwise the first
                     // listener restart could kill the just-launched daemon.
                     if (!armLoopback(appContext, adb) || !connectLoopback(appContext, adb)) {
-                        throw IOException("No se pudo preparar el transporte local sin Wi-Fi. Mantén Wi-Fi conectado y vuelve a intentarlo.")
+                        throw IOException("No se pudo preparar el transporte tcpip sin Wi-Fi. Mantén Wi-Fi conectado y vuelve a intentarlo.")
                     }
                 }
             }
@@ -134,11 +168,13 @@ object EmbeddedAdbManager {
      * arming: `tcpip:` restarts adbd and must never be issued while relying on that old daemon.
      */
     suspend fun enableOfflineRecording(context: Context): Boolean = withContext(Dispatchers.IO) {
+        checkTransportChangeAllowed()
         val appContext = context.applicationContext
         val prefs = AppPreferences(appContext)
         prefs.setOfflineRecordingEnabled(true)
         try {
             val alreadyWarm = shellService?.asBinder()?.isBinderAlive == true
+            var needsRecovery = !alreadyWarm
             if (alreadyWarm) {
                 launchMutex.withLock {
                     if (shellService?.asBinder()?.isBinderAlive == true) {
@@ -147,22 +183,27 @@ object EmbeddedAdbManager {
                         }
                         val adb = AdbConnectionManager.getInstance(appContext)
                         if (!adb.isConnected) connectWireless(appContext, adb)
-                        shellService = null
-                        linkedBinder?.let { old -> runCatching { old.unlinkToDeath(deathRecipient, 0) } }
-                        linkedBinder = null
+                        synchronized(binderLock) {
+                            shellService = null
+                            linkedBinder?.let { old -> runCatching { old.unlinkToDeath(linkedDeathRecipient ?: deathRecipient, 0) } }
+                            linkedBinder = null
+                            linkedDeathRecipient = null
+                        }
                         armLoopback(appContext, adb)
                         if (!connectLoopback(appContext, adb)) {
-                            throw IOException("Android no volvió a publicar el transporte local después de reiniciar adbd.")
+                            throw IOException("Android no volvió a publicar el transporte tcpip después de reiniciar adbd.")
                         }
                         grantSecureSettingsIfNeeded(appContext, adb)
                         killStaleDaemons(adb)
                         launchDaemon(appContext, adb)
                         awaitShellService()
+                        needsRecovery = false
+                    } else {
+                        needsRecovery = true
                     }
                 }
-            } else {
-                getShellService(appContext)
             }
+            if (needsRecovery) getShellService(appContext)
             true
         } catch (error: Throwable) {
             prefs.setOfflineRecordingEnabled(false)
@@ -176,24 +217,38 @@ object EmbeddedAdbManager {
      * preference is still cleared and the port will disappear on the next reboot.
      */
     suspend fun disableOfflineRecording(context: Context) = withContext(Dispatchers.IO) {
+        checkTransportChangeAllowed()
         val appContext = context.applicationContext
-        AppPreferences(appContext).setOfflineRecordingEnabled(false)
-        runCatching {
-            val adb = AdbConnectionManager.getInstance(appContext)
-            if (!adb.isConnected) adb.connect("127.0.0.1", AppPreferences(appContext).getLoopbackAdbPort())
-            if (adb.isConnected) {
-                shellService?.let { runCatching { it.destroy() } }
-                shellService = null
-                val worker = Thread {
-                    runCatching { adb.openStream("usb:").close() }
-                        .onFailure { AppLogger.d(TAG, "tcpip disarm ended while adbd restarted: ${it.localizedMessage}") }
-                }.apply { isDaemon = true; name = "grabaciones-adb-disarm-loopback" }
-                worker.start()
-                worker.join(3_000L)
-                adb.disconnect()
-            }
-        }.onFailure { AppLogger.w(TAG, "Could not close the off-Wi-Fi transport; it will reset on reboot", it) }
-        AppLogger.i(TAG, "Off-Wi-Fi transport disabled")
+        launchMutex.withLock {
+            AppPreferences(appContext).setOfflineRecordingEnabled(false)
+            runCatching {
+                val ownPort = AppPreferences(appContext).getLoopbackAdbPort()
+                val currentPort = adbdTcpPort()
+                if (currentPort != null && currentPort != ownPort) {
+                    AppLogger.i(TAG, "Not disarming tcpip port $currentPort because it belongs to another transport")
+                    return@runCatching
+                }
+                val adb = AdbConnectionManager.getInstance(appContext)
+                if (!adb.isConnected) adb.connect("127.0.0.1", ownPort)
+                if (adb.isConnected) {
+                    shellService?.let { runCatching { it.destroy() } }
+                    synchronized(binderLock) {
+                        shellService = null
+                        linkedBinder?.let { old -> runCatching { old.unlinkToDeath(linkedDeathRecipient ?: deathRecipient, 0) } }
+                        linkedBinder = null
+                        linkedDeathRecipient = null
+                    }
+                    val worker = Thread {
+                        runCatching { adb.openStream("usb:").close() }
+                            .onFailure { AppLogger.d(TAG, "tcpip disarm ended while adbd restarted: ${it.localizedMessage}") }
+                    }.apply { isDaemon = true; name = "grabaciones-adb-disarm-loopback" }
+                    worker.start()
+                    worker.join(3_000L)
+                    disconnectBounded(adb)
+                }
+            }.onFailure { AppLogger.w(TAG, "Could not close the off-Wi-Fi transport; it will reset on reboot", it) }
+            AppLogger.i(TAG, "Off-Wi-Fi transport disabled")
+        }
     }
 
     /** Wireless-debugging bootstrap. This is deliberately absent from the hot path when the Binder is alive. */
@@ -202,29 +257,65 @@ object EmbeddedAdbManager {
         if (adb.isConnected) return true
         val endpoint = AdbMdns.discoverEndpoint(context, AdbMdns.TLS_CONNECT, CONNECT_DISCOVERY_TIMEOUT_MS)
             ?: throw IOException("No se encontró el servicio de depuración inalámbrica durante la inicialización. Comprueba Wi-Fi y Depuración inalámbrica.")
-        return runCatching {
-            adb.connect(endpoint.host, endpoint.port)
-            true
-        }.onFailure {
-            if (it is io.github.muntashirakon.adb.AdbPairingRequiredException) {
+        val failure = AtomicReference<Throwable?>(null)
+        val connected = AtomicBoolean(false)
+        val worker = Thread {
+            runCatching {
+                adb.connect(endpoint.host, endpoint.port)
+                connected.set(adb.isConnected)
+            }.onFailure { failure.set(it) }
+        }.apply { isDaemon = true; name = "grabaciones-adb-connect-wireless" }
+        worker.start()
+        worker.join(CONNECT_HANDSHAKE_TIMEOUT_MS)
+        if (worker.isAlive) {
+            worker.interrupt()
+            disconnectBounded(adb)
+            throw IOException("El handshake ADB inalámbrico superó ${CONNECT_HANDSHAKE_TIMEOUT_MS} ms.")
+        }
+        failure.get()?.let { error ->
+            if (error is io.github.muntashirakon.adb.AdbPairingRequiredException) {
                 AppPreferences(context).setAdbPaired(false)
-                throw IOException("Android ya no reconoce esta identidad ADB. Vuelve a emparejar desde el asistente.", it)
+                throw IOException("Android ya no reconoce esta identidad ADB. Vuelve a emparejar desde el asistente.", error)
             }
-        }.getOrElse { throw IOException("No se pudo conectar al servicio ADB ${endpoint.host}:${endpoint.port}: ${it.localizedMessage}", it) }
+            throw IOException("No se pudo conectar al servicio ADB ${endpoint.host}:${endpoint.port}: ${error.localizedMessage}", error)
+        }
+        return connected.get()
     }
 
     /** Connects to classic tcpip on loopback; no Wi-Fi or Internet is involved. */
     private fun connectLoopback(context: Context, adb: AdbConnectionManager): Boolean {
-        // The manager does not expose the current endpoint. Drop a possibly stale wireless
-        // connection before attempting loopback; this is safe because no Binder is alive here.
-        if (adb.isConnected) runCatching { adb.disconnect() }
         val port = AppPreferences(context).getLoopbackAdbPort()
-        return runCatching {
-            adb.connect("127.0.0.1", port)
-            adb.isConnected
-        }.onFailure { AppLogger.d(TAG, "Loopback tcpip :$port unavailable: ${it.localizedMessage}") }.getOrDefault(false)
-            .also { if (it) AppLogger.i(TAG, "Connected to adbd over loopback :$port") }
+        val configured = adbdTcpPort() == port
+        val deadline = System.currentTimeMillis() +
+            if (configured) LOOPBACK_RECOVERY_TIMEOUT_MS else LOOPBACK_RETRY_INTERVAL_MS
+        do {
+            if (adb.isConnected) disconnectBounded(adb)
+            val connected = runCatching {
+                adb.connect("127.0.0.1", port)
+                adb.isConnected
+            }.onFailure { AppLogger.d(TAG, "Loopback tcpip :$port unavailable: ${it.localizedMessage}") }.getOrDefault(false)
+            if (connected) {
+                AppLogger.i(TAG, "Connected to adbd over loopback :$port")
+                return true
+            }
+            if (System.currentTimeMillis() < deadline) Thread.sleep(LOOPBACK_RETRY_INTERVAL_MS)
+        } while (System.currentTimeMillis() < deadline)
+        return false
     }
+
+    private fun disconnectBounded(adb: AdbConnectionManager) {
+        val worker = Thread { runCatching { adb.disconnect() } }
+            .apply { isDaemon = true; name = "grabaciones-adb-disconnect" }
+        worker.start()
+        runCatching { worker.join(DISCONNECT_TIMEOUT_MS) }
+        if (worker.isAlive) AppLogger.w(TAG, "ADB disconnect is still blocked after ${DISCONNECT_TIMEOUT_MS} ms")
+    }
+
+    private fun adbdTcpPort(): Int? = runCatching {
+        Class.forName("android.os.SystemProperties")
+            .getMethod("get", String::class.java)
+            .invoke(null, "service.adb.tcp.port") as? String
+    }.getOrNull()?.toIntOrNull()
 
     /**
      * Arms classic tcpip through the current Wireless-debugging connection. Opening tcpip
@@ -233,14 +324,18 @@ object EmbeddedAdbManager {
      */
     private fun armLoopback(context: Context, adb: AdbConnectionManager): Boolean {
         val port = AppPreferences(context).getLoopbackAdbPort()
-        AppLogger.i(TAG, "Arming off-Wi-Fi loopback transport on :$port")
+        val existingPort = adbdTcpPort()
+        if (existingPort != null && existingPort != port) {
+            throw IOException("adbd ya está en modo tcpip en el puerto $existingPort; no se reiniciará para reemplazar el transporte de otra aplicación.")
+        }
+        AppLogger.i(TAG, "Arming off-Wi-Fi tcpip transport on :$port")
         val worker = Thread {
             runCatching { adb.openStream("tcpip:$port").close() }
                 .onFailure { AppLogger.d(TAG, "tcpip arm ended while adbd restarted: ${it.localizedMessage}") }
         }.apply { isDaemon = true; name = "grabaciones-adb-arm-loopback" }
         worker.start()
         runCatching { worker.join(3_000L) }
-        runCatching { adb.disconnect() }
+        disconnectBounded(adb)
         Thread.sleep(1_500L)
         return true
     }
@@ -258,11 +353,36 @@ object EmbeddedAdbManager {
             AppLogger.e(TAG, "ADB daemon delivered an invalid recorder Binder")
             return
         }
-        linkedBinder?.let { old -> runCatching { old.unlinkToDeath(deathRecipient, 0) } }
-        linkedBinder = binder
-        shellService = service
+        val recipient = IBinder.DeathRecipient {
+            var wasCurrent = false
+            synchronized(binderLock) {
+                // A delayed death callback from an older daemon must not clear a newer Binder.
+                if (linkedBinder === binder) {
+                    shellService = null
+                    linkedBinder = null
+                    linkedDeathRecipient = null
+                    wasCurrent = true
+                }
+            }
+            if (wasCurrent) {
+                AppLogger.e(TAG, SERVICE_LOST_ERROR)
+                serviceLostListeners.forEach { listener -> runCatching(listener) }
+            }
+        }
+        synchronized(binderLock) {
+            linkedBinder?.let { old ->
+                runCatching { old.unlinkToDeath(linkedDeathRecipient ?: deathRecipient, 0) }
+            }
+            linkedBinder = binder
+            linkedDeathRecipient = recipient
+            shellService = service
+            try {
+                binder.linkToDeath(recipient, 0)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Could not link the delivered recorder Binder to death", e)
+            }
+        }
         try {
-            binder.linkToDeath(deathRecipient, 0)
             val prefs = AppPreferences(context)
             service.setLogCallback(AppLogger.callback, !prefs.isDebugEnabled())
             AppLogger.i(TAG, "Shell UID CAPTURE_AUDIO_OUTPUT permission: ${service.canCaptureAudioOutput()}")
@@ -276,9 +396,14 @@ object EmbeddedAdbManager {
     suspend fun canCaptureAudioOutput(context: Context): Boolean =
         runCatching { getShellService(context).canCaptureAudioOutput() }.getOrDefault(false)
 
+    // Retained only for compatibility with a Binder that was installed before the identity-aware
+    // recipient was introduced; new deliveries always use a recipient bound to their Binder.
     private val deathRecipient = IBinder.DeathRecipient {
-        shellService = null
-        linkedBinder = null
+        synchronized(binderLock) {
+            shellService = null
+            linkedBinder = null
+            linkedDeathRecipient = null
+        }
         AppLogger.e(TAG, SERVICE_LOST_ERROR)
         serviceLostListeners.forEach { listener -> runCatching(listener) }
     }
@@ -294,12 +419,30 @@ object EmbeddedAdbManager {
         Thread.sleep(750)
     }
 
+    /** Drains an ADB stream without allowing a half-dead adbd connection to block forever. */
+    private fun readAdbStreamBounded(stream: AdbStream, timeoutMs: Long): String {
+        val result = AtomicReference("")
+        val worker = Thread {
+            runCatching {
+                stream.openInputStream().bufferedReader().use { result.set(it.readText()) }
+            }
+        }.apply { isDaemon = true; name = "grabaciones-adb-read" }
+        worker.start()
+        worker.join(timeoutMs)
+        if (worker.isAlive) {
+            runCatching { stream.close() }
+            worker.interrupt()
+            AppLogger.w(TAG, "ADB stream read exceeded ${timeoutMs} ms; continuing without its output")
+        }
+        return result.get()
+    }
+
     private fun grantSecureSettingsIfNeeded(context: Context, adb: AdbConnectionManager) {
         if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED) return
         runCatching {
             val command = "pm grant ${context.packageName} android.permission.WRITE_SECURE_SETTINGS; echo GRABACIONES_GRANT:$?"
             val result = adb.openStream("shell:$command").use { stream ->
-                stream.openInputStream().bufferedReader().use { it.readText() }
+                readAdbStreamBounded(stream, ADB_READ_TIMEOUT_MS)
             }
             AppLogger.i(TAG, "WRITE_SECURE_SETTINGS shell grant result: ${result.trim()}")
         }.onFailure { AppLogger.w(TAG, "Could not grant WRITE_SECURE_SETTINGS; reboot recovery may need manual Wireless debugging", it) }
@@ -308,7 +451,7 @@ object EmbeddedAdbManager {
     private fun killStaleDaemons(adb: AdbConnectionManager) {
         runCatching {
             val command = "p=\$(pgrep -f 'org.jcastillo.grabaciones.services.daemon.Embedded[R]ecorderDaemon' 2>/dev/null); [ -n \"\$p\" ] && kill \$p 2>/dev/null; true"
-            adb.openStream("shell:$command").use { it.openInputStream().bufferedReader().use { reader -> reader.readText() } }
+            adb.openStream("shell:$command").use { readAdbStreamBounded(it, ADB_READ_TIMEOUT_MS) }
         }.onFailure { AppLogger.w(TAG, "Could not clear an earlier recorder daemon; continuing with a fresh launch", it) }
     }
 
@@ -316,8 +459,12 @@ object EmbeddedAdbManager {
         val apkPath = context.applicationInfo.sourceDir
         val authority = EmbeddedAdbBinderProvider.AUTHORITY
         val command = "setsid sh -c 'CLASSPATH=$apkPath exec app_process / $DAEMON_CLASS $authority' >/dev/null 2>&1 </dev/null & sleep 3"
-        runCatching {
-            adb.openStream("shell:$command").use { it.openInputStream().bufferedReader().use { reader -> reader.readText() } }
-        }.onFailure { AppLogger.w(TAG, "ADB launch stream closed; waiting for daemon Binder delivery", it) }
+        // Keep the parent shell alive long enough for app_process to detach, but do not make the
+        // recording path wait the full sleep once the daemon has delivered its Binder.
+        Thread {
+            runCatching {
+                adb.openStream("shell:$command").use { readAdbStreamBounded(it, LAUNCH_DRAIN_TIMEOUT_MS) }
+            }.onFailure { AppLogger.w(TAG, "ADB launch stream closed; waiting for daemon Binder delivery", it) }
+        }.apply { isDaemon = true; name = "grabaciones-daemon-launch-drain" }.start()
     }
 }

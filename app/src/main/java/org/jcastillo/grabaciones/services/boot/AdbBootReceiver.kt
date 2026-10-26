@@ -17,7 +17,12 @@ import org.jcastillo.grabaciones.utils.AppLogger
 class AdbBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED && intent.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
-        if (!AppPreferences(context).isAdbPaired()) return
+        val preferences = AppPreferences(context)
+        if (!preferences.isAdbPaired()) return
+        // Pairing alone is not consent to keep a network debugging endpoint enabled after every
+        // reboot. Only the explicit off-Wi-Fi opt-in justifies the bootstrap; normal recording
+        // will request Wireless debugging when the user actually starts a call.
+        if (!preferences.isOfflineRecordingEnabled()) return
         if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.WRITE_SECURE_SETTINGS) != PackageManager.PERMISSION_GRANTED) {
             AppLogger.w(TAG, "ADB pairing exists, but WRITE_SECURE_SETTINGS was not granted; reboot auto-recovery is unavailable")
             return
