@@ -380,6 +380,8 @@ private fun SettingsScreen(preferences: AppPreferences, onBack: () -> Unit) {
     var autoRecordOutgoing by remember { mutableStateOf(preferences.isAutoRecordOutgoingEnabled()) }
     var source by remember { mutableStateOf(preferences.getAudioSource()) }
     var detailedLogging by remember { mutableStateOf(preferences.isLoggingEnabled()) }
+    var offlineRecording by remember { mutableStateOf(preferences.isOfflineRecordingEnabled()) }
+    var offlineBusy by remember { mutableStateOf(false) }
     var licenseTitle by remember { mutableStateOf("") }
     var licenseText by remember { mutableStateOf<String?>(null) }
     val settingsScope = rememberCoroutineScope()
@@ -438,6 +440,53 @@ private fun SettingsScreen(preferences: AppPreferences, onBack: () -> Unit) {
             }
 
             MegaBackupSettingsSection()
+
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Grabación sin Wi-Fi", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Arma una vez un transporte ADB local autenticado por RSA. Después de inicializarlo con Wi-Fi, las llamadas usan el Binder del servicio y pueden grabarse con datos móviles o sin red.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Permitir grabación fuera de Wi-Fi", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Switch(
+                            checked = offlineRecording,
+                            enabled = !offlineBusy,
+                            onCheckedChange = { enabled ->
+                                if (!enabled) {
+                                    offlineBusy = true
+                                    settingsScope.launch {
+                                        withContext(Dispatchers.IO) { EmbeddedAdbManager.disableOfflineRecording(context) }
+                                        offlineRecording = false
+                                        offlineBusy = false
+                                    }
+                                } else {
+                                    offlineBusy = true
+                                    settingsScope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            runCatching { EmbeddedAdbManager.enableOfflineRecording(context) }
+                                        }
+                                        offlineBusy = false
+                                        if (result.isSuccess) {
+                                            offlineRecording = true
+                                            Toast.makeText(context, "Transporte sin Wi-Fi preparado.", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            offlineRecording = false
+                                            Toast.makeText(context, "No se pudo preparar: ${result.exceptionOrNull()?.localizedMessage}", Toast.LENGTH_LONG).show()
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                    }
+                    Text(
+                        "Es una opción de CallVault 1.4.0. Abre un puerto tcpip local protegido por la clave ADB; desactívala si no aceptas esa superficie adicional. Tras reiniciar, debe rearmarse con Wi-Fi.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
 
             Text("Captura de audio", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text("Siempre MP3 mono, 64 kbps. No se recurre al micrófono si falla una de las dos rutas.", style = MaterialTheme.typography.bodySmall)

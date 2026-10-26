@@ -6,6 +6,8 @@ package org.jcastillo.grabaciones.integrations.adb
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.IBinder
 import android.provider.Settings
 import androidx.core.content.ContextCompat
@@ -61,43 +63,193 @@ object EmbeddedAdbManager {
         paired
     }
 
-    /** Connects to adbd, starts the detached shell-UID recorder, and returns its Binder. */
+    /**
+     * Connects to the already-running privileged daemon when possible. ADB is only used to
+     * bootstrap or recover that daemon; recording commands themselves use Binder.
+     *
+     * When off-Wi-Fi recording is enabled, the first setup arms CallVault's classic-tcpip
+     * loopback listener once over Wireless debugging. Later calls use 127.0.0.1 and never run
+     * mDNS discovery, so losing Wi-Fi is not treated as losing the recorder.
+     */
     suspend fun getShellService(context: Context): IShellService = withContext(Dispatchers.IO) {
-        shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return@withContext it }
+        shellService?.takeIf { it.asBinder().isBinderAlive }?.let {
+            AppLogger.d(TAG, "Reusing live recorder Binder; no ADB/Wi-Fi check")
+            return@withContext it
+        }
         if (!isPaired(context)) {
             throw IllegalStateException("Esta instalación aún no está emparejada con la depuración inalámbrica de Android.")
         }
 
         launchMutex.withLock {
             shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return@withLock it }
-            val adb = AdbConnectionManager.getInstance(context.applicationContext)
-            ensureWirelessDebuggingEnabled(context)
-            if (!adb.isConnected) {
-                val endpoint = AdbMdns.discoverEndpoint(context, AdbMdns.TLS_CONNECT, CONNECT_DISCOVERY_TIMEOUT_MS)
-                    ?: throw IOException("No se encontró el servicio de depuración inalámbrica. Activa Depuración inalámbrica, conecta Wi-Fi y vuelve a intentarlo.")
-                runCatching { adb.connect(endpoint.host, endpoint.port) }
-                    .onFailure {
-                        if (it is io.github.muntashirakon.adb.AdbPairingRequiredException) {
-                            AppPreferences(context).setAdbPaired(false)
-                            throw IOException("Android ya no reconoce esta identidad ADB. Vuelve a emparejar desde el asistente.", it)
-                        }
-                        throw IOException("No se pudo conectar al servicio ADB ${endpoint.host}:${endpoint.port}: ${it.localizedMessage}", it)
+            val appContext = context.applicationContext
+            val adb = AdbConnectionManager.getInstance(appContext)
+            val offline = AppPreferences(appContext).isOfflineRecordingEnabled()
+
+            var connected = if (offline) connectLoopback(appContext, adb) else false
+            if (!connected) {
+                // Wireless debugging is a bootstrap/recovery transport, not a prerequisite for
+                // an already delivered Binder. Do not even start mDNS when it cannot exist.
+                if (!isWifiConnected(appContext)) {
+                    throw IOException(
+                        "El servicio privilegiado no está conectado y el transporte sin Wi-Fi no está preparado. " +
+                            "Conecta Wi-Fi una vez para inicializarlo o activa Grabación sin Wi-Fi en Ajustes."
+                    )
+                }
+                connected = connectWireless(appContext, adb)
+                if (connected && offline) {
+                    // tcpip: restarts adbd and invalidates this ADB connection. The daemon is
+                    // launched only after reconnecting through loopback; otherwise the first
+                    // listener restart could kill the just-launched daemon.
+                    if (!armLoopback(appContext, adb) || !connectLoopback(appContext, adb)) {
+                        throw IOException("No se pudo preparar el transporte local sin Wi-Fi. Mantén Wi-Fi conectado y vuelve a intentarlo.")
                     }
+                }
             }
-            grantSecureSettingsIfNeeded(context, adb)
+            if (!connected && !adb.isConnected) {
+                throw IOException("No se pudo establecer un transporte ADB para recuperar el servicio privilegiado.")
+            }
+            grantSecureSettingsIfNeeded(appContext, adb)
 
             shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return@withLock it }
             killStaleDaemons(adb)
-            launchDaemon(context, adb)
+            launchDaemon(appContext, adb)
 
-            val deadline = System.currentTimeMillis() + BINDER_WAIT_TIMEOUT_MS
-            while (System.currentTimeMillis() < deadline) {
-                shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return@withLock it }
-                delay(150)
-            }
-            throw IOException("ADB conectó, pero el servicio de grabación no entregó su Binder. Reinicia la depuración inalámbrica y vuelve a intentarlo.")
+            return@withLock awaitShellService()
         }
     }
+
+    private suspend fun awaitShellService(): IShellService {
+        val deadline = System.currentTimeMillis() + BINDER_WAIT_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            shellService?.takeIf { it.asBinder().isBinderAlive }?.let { return it }
+            delay(150)
+        }
+        throw IOException("El transporte ADB está conectado, pero el servicio privilegiado no entregó su Binder. Revisa el diagnóstico del servicio, no la conexión a Internet.")
+    }
+
+    /**
+     * Enables the loopback transport and verifies that the privileged daemon can be recovered
+     * through it. If a daemon was already warm over Wireless debugging, it is relaunched after
+     * arming: `tcpip:` restarts adbd and must never be issued while relying on that old daemon.
+     */
+    suspend fun enableOfflineRecording(context: Context): Boolean = withContext(Dispatchers.IO) {
+        val appContext = context.applicationContext
+        val prefs = AppPreferences(appContext)
+        prefs.setOfflineRecordingEnabled(true)
+        try {
+            val alreadyWarm = shellService?.asBinder()?.isBinderAlive == true
+            if (alreadyWarm) {
+                launchMutex.withLock {
+                    if (shellService?.asBinder()?.isBinderAlive == true) {
+                        if (!isWifiConnected(appContext)) {
+                            throw IOException("Para preparar el transporte sin Wi-Fi necesitas Wi-Fi una sola vez; el servicio actual sigue operativo.")
+                        }
+                        val adb = AdbConnectionManager.getInstance(appContext)
+                        if (!adb.isConnected) connectWireless(appContext, adb)
+                        shellService = null
+                        linkedBinder?.let { old -> runCatching { old.unlinkToDeath(deathRecipient, 0) } }
+                        linkedBinder = null
+                        armLoopback(appContext, adb)
+                        if (!connectLoopback(appContext, adb)) {
+                            throw IOException("Android no volvió a publicar el transporte local después de reiniciar adbd.")
+                        }
+                        grantSecureSettingsIfNeeded(appContext, adb)
+                        killStaleDaemons(adb)
+                        launchDaemon(appContext, adb)
+                        awaitShellService()
+                    }
+                }
+            } else {
+                getShellService(appContext)
+            }
+            true
+        } catch (error: Throwable) {
+            prefs.setOfflineRecordingEnabled(false)
+            throw error
+        }
+    }
+
+    /**
+     * Disables the opt-in transport and best-effort reverts adbd to USB mode. This is an idle
+     * settings operation, never part of a recording start. If Android refuses the restart, the
+     * preference is still cleared and the port will disappear on the next reboot.
+     */
+    suspend fun disableOfflineRecording(context: Context) = withContext(Dispatchers.IO) {
+        val appContext = context.applicationContext
+        AppPreferences(appContext).setOfflineRecordingEnabled(false)
+        runCatching {
+            val adb = AdbConnectionManager.getInstance(appContext)
+            if (!adb.isConnected) adb.connect("127.0.0.1", AppPreferences(appContext).getLoopbackAdbPort())
+            if (adb.isConnected) {
+                shellService?.let { runCatching { it.destroy() } }
+                shellService = null
+                val worker = Thread {
+                    runCatching { adb.openStream("usb:").close() }
+                        .onFailure { AppLogger.d(TAG, "tcpip disarm ended while adbd restarted: ${it.localizedMessage}") }
+                }.apply { isDaemon = true; name = "grabaciones-adb-disarm-loopback" }
+                worker.start()
+                worker.join(3_000L)
+                adb.disconnect()
+            }
+        }.onFailure { AppLogger.w(TAG, "Could not close the off-Wi-Fi transport; it will reset on reboot", it) }
+        AppLogger.i(TAG, "Off-Wi-Fi transport disabled")
+    }
+
+    /** Wireless-debugging bootstrap. This is deliberately absent from the hot path when the Binder is alive. */
+    private fun connectWireless(context: Context, adb: AdbConnectionManager): Boolean {
+        ensureWirelessDebuggingEnabled(context)
+        if (adb.isConnected) return true
+        val endpoint = AdbMdns.discoverEndpoint(context, AdbMdns.TLS_CONNECT, CONNECT_DISCOVERY_TIMEOUT_MS)
+            ?: throw IOException("No se encontró el servicio de depuración inalámbrica durante la inicialización. Comprueba Wi-Fi y Depuración inalámbrica.")
+        return runCatching {
+            adb.connect(endpoint.host, endpoint.port)
+            true
+        }.onFailure {
+            if (it is io.github.muntashirakon.adb.AdbPairingRequiredException) {
+                AppPreferences(context).setAdbPaired(false)
+                throw IOException("Android ya no reconoce esta identidad ADB. Vuelve a emparejar desde el asistente.", it)
+            }
+        }.getOrElse { throw IOException("No se pudo conectar al servicio ADB ${endpoint.host}:${endpoint.port}: ${it.localizedMessage}", it) }
+    }
+
+    /** Connects to classic tcpip on loopback; no Wi-Fi or Internet is involved. */
+    private fun connectLoopback(context: Context, adb: AdbConnectionManager): Boolean {
+        // The manager does not expose the current endpoint. Drop a possibly stale wireless
+        // connection before attempting loopback; this is safe because no Binder is alive here.
+        if (adb.isConnected) runCatching { adb.disconnect() }
+        val port = AppPreferences(context).getLoopbackAdbPort()
+        return runCatching {
+            adb.connect("127.0.0.1", port)
+            adb.isConnected
+        }.onFailure { AppLogger.d(TAG, "Loopback tcpip :$port unavailable: ${it.localizedMessage}") }.getOrDefault(false)
+            .also { if (it) AppLogger.i(TAG, "Connected to adbd over loopback :$port") }
+    }
+
+    /**
+     * Arms classic tcpip through the current Wireless-debugging connection. Opening tcpip
+     * restarts adbd, therefore the operation is bounded, followed by an explicit disconnect
+     * and a loopback reconnect. It is never called while recording.
+     */
+    private fun armLoopback(context: Context, adb: AdbConnectionManager): Boolean {
+        val port = AppPreferences(context).getLoopbackAdbPort()
+        AppLogger.i(TAG, "Arming off-Wi-Fi loopback transport on :$port")
+        val worker = Thread {
+            runCatching { adb.openStream("tcpip:$port").close() }
+                .onFailure { AppLogger.d(TAG, "tcpip arm ended while adbd restarted: ${it.localizedMessage}") }
+        }.apply { isDaemon = true; name = "grabaciones-adb-arm-loopback" }
+        worker.start()
+        runCatching { worker.join(3_000L) }
+        runCatching { adb.disconnect() }
+        Thread.sleep(1_500L)
+        return true
+    }
+
+    private fun isWifiConnected(context: Context): Boolean = runCatching {
+        val manager = context.getSystemService(ConnectivityManager::class.java) ?: return false
+        val network = manager.activeNetwork ?: return false
+        manager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    }.getOrDefault(false)
 
     /** Called only by the exported provider after it verifies that the sender is the shell UID. */
     fun onBinderReceived(context: Context, binder: IBinder) {

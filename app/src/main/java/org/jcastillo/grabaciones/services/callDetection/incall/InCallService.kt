@@ -13,6 +13,7 @@ import android.telecom.Call
 import android.telecom.Connection
 import android.telecom.InCallService
 import android.telecom.TelecomManager
+import android.os.SystemClock
 import androidx.annotation.RequiresApi
 import org.jcastillo.grabaciones.data.AppPreferences
 import org.jcastillo.grabaciones.data.call.CallDirection
@@ -85,7 +86,18 @@ class InCallService : InCallService() {
         // Assign and register tracking handles
         activeTrackedCall = call
         call.registerCallback(callCallback)
+        AppLogger.i( "[TIMING] call-detected ${SystemClock.elapsedRealtime()}ms state=${callStateToString(call.details.state)}")
         AppLogger.i( "Primary call session detected and tracking initialized. Current state is: ${callStateToString(call.details.state)} (${call.details.state})")
+
+        // Start the foreground service in standby as soon as Telecom gives us a ringing/dialing
+        // call. This warms the privileged daemon before ACTIVE, without recording early audio.
+        if (call.details.state != Call.STATE_ACTIVE) {
+            serviceScope.launch {
+                val raw = rawCallData(call)
+                AppLogger.i("[TIMING] prewarm-request ${SystemClock.elapsedRealtime()}ms")
+                RecordingDecisionEngine.getInstance(this@InCallService).prepareRecording(raw)
+            }
+        }
 
         // Edge Case: If the call is already active when we receive it
         if (call.details.state == Call.STATE_ACTIVE) {
@@ -151,31 +163,13 @@ class InCallService : InCallService() {
             AppLogger.i( "Primary call became ACTIVE. Triggering Decision Engine Pipeline.")
 
             val details = call.details
-            val rawNumber = details.handle?.schemeSpecificPart ?: ""
-
-            val direction = when (details.callDirection) {
-                Call.Details.DIRECTION_INCOMING -> CallDirection.INCOMING
-                Call.Details.DIRECTION_OUTGOING -> CallDirection.OUTGOING
-                else -> CallDirection.OUTGOING // Default to OUTGOING if direction is unknown
-            }
-
-            // First attempt to get the name from the user contacts list, then fallback to the telecom-provided caller name
-            // (which may be defined by the caller or a third-party app)
-            val osCallerName = details.contactDisplayName ?: details.callerDisplayName
-
             val isSelfManaged = details.hasProperty(Call.Details.PROPERTY_SELF_MANAGED)
             val isVoip = details.hasProperty(Call.Details.PROPERTY_VOIP_AUDIO_MODE) // VoIP means audio is routed outside MediaRecorder, we must use AudioPlayback.
             val isWifiCall = details.hasProperty(Call.Details.PROPERTY_WIFI)
             AppLogger.d( "Primary call details - isSelfManaged: $isSelfManaged, isVoip: $isVoip, isWifiCall: $isWifiCall")
 
 
-            val rawCallData = RawCallData(
-                rawPhoneNumber = PhoneNumberManager.normalisePhoneNumber(rawNumber),
-                direction = direction,
-                osProvidedCallerName = osCallerName,
-                packageName = packageName,
-                isCallAudioVoIpBased = isVoip,
-            )
+            val rawCallData = rawCallData(call)
 
             serviceScope.launch {
                 val intentSentSuccessfully = RecordingDecisionEngine.getInstance(this@InCallService).executeDecisionPipeline(rawCallData)
@@ -187,6 +181,22 @@ class InCallService : InCallService() {
                 }
             }
         }
+    }
+
+    private fun rawCallData(call: Call): RawCallData {
+        val details = call.details
+        val packageName = details.accountHandle?.componentName?.packageName
+        val direction = when (details.callDirection) {
+            Call.Details.DIRECTION_INCOMING -> CallDirection.INCOMING
+            else -> CallDirection.OUTGOING
+        }
+        return RawCallData(
+            rawPhoneNumber = PhoneNumberManager.normalisePhoneNumber(details.handle?.schemeSpecificPart ?: ""),
+            direction = direction,
+            osProvidedCallerName = details.contactDisplayName ?: details.callerDisplayName,
+            packageName = packageName,
+            isCallAudioVoIpBased = details.hasProperty(Call.Details.PROPERTY_VOIP_AUDIO_MODE),
+        )
     }
 
     /**

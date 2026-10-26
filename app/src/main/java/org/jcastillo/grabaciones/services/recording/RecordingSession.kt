@@ -8,6 +8,7 @@ import android.app.Service
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.os.RemoteException
+import android.os.SystemClock
 import org.jcastillo.grabaciones.IRecordingCallback
 import org.jcastillo.grabaciones.IShellService
 import org.jcastillo.grabaciones.data.call.EnrichedCallData
@@ -72,7 +73,9 @@ class RecordingSession(
                 wavFile,
                 ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_READ_WRITE or ParcelFileDescriptor.MODE_TRUNCATE,
             )
+            AppLogger.i("[TIMING] capture-dispatch ${SystemClock.elapsedRealtime()}ms primary=${plan.primary}")
             remoteService.startRecording(checkNotNull(outputPfd), plan, recordingCallback)
+            AppLogger.i("[TIMING] capture-dispatched ${SystemClock.elapsedRealtime()}ms")
             AppLogger.i("Remote PCM capture started; the WAV is private until MP3 conversion succeeds.")
         } catch (error: RemoteException) {
             cancel()

@@ -291,7 +291,7 @@
     <string name="recording_failure_mp3_publish">No se pudo verificar o guardar el MP3. El WAV temporal se conservó en el almacenamiento privado; revisa el informe de errores.</string>
     <!-- Recording Service: Embedded ADB errors -->
     <string name="recording_error_adb_disconnected_unexpectedly">El servicio shell ADB se desconectó durante la llamada. La grabación se detuvo y no se sustituirá con el micrófono.</string>
-    <string name="recording_adb_not_started">No se pudo iniciar el servicio de grabación ADB. Comprueba la depuración inalámbrica, la conexión Wi-Fi y el emparejamiento desde la app.</string>
+    <string name="recording_adb_not_started">No se pudo iniciar o recuperar el servicio privilegiado de grabación. Revisa el diagnóstico: la grabación no se sustituirá silenciosamente por el micrófono.</string>
 
     <!-- ADB pairing foreground notification -->
     <string name="notif_pairing_channel">Emparejamiento ADB</string>

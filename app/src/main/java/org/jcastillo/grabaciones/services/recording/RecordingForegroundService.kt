@@ -15,6 +15,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.content.IntentCompat
 import androidx.documentfile.provider.DocumentFile
 import org.jcastillo.grabaciones.IShellService
@@ -121,6 +122,7 @@ class RecordingForegroundService : Service() {
             var oldState: RecordingServiceState = _serviceState.value
             _serviceState.collect { newState ->
                 if (oldState != newState) {
+                    AppLogger.i("[TIMING] notification-state ${SystemClock.elapsedRealtime()}ms state=${newState::class.simpleName}")
                     updateNotification()
                     notificationHelper.handleStateChangeToasts(oldState, newState)
                     overlayController.showOverlay(newState)
@@ -150,6 +152,7 @@ class RecordingForegroundService : Service() {
      */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
+        AppLogger.i("[TIMING] fgs-command ${SystemClock.elapsedRealtime()}ms action=$action")
         val state = _serviceState.value
 
         var currentMeta = state.metadata
@@ -191,6 +194,7 @@ class RecordingForegroundService : Service() {
                 serviceScope.launch {
                     try {
                         val service = EmbeddedAdbManager.getShellService(this@RecordingForegroundService)
+                        AppLogger.i("[TIMING] privileged-service-ready ${SystemClock.elapsedRealtime()}ms")
                         shellService = service
                         if (!service.canCaptureAudioOutput()) {
                             throw SecurityException("Android no concedió CAPTURE_AUDIO_OUTPUT al proceso shell.")
@@ -331,6 +335,7 @@ class RecordingForegroundService : Service() {
             )
         }
 
+        AppLogger.i("[TIMING] capture-session-active ${SystemClock.elapsedRealtime()}ms")
         AppLogger.i("The recording session has been started successfully. Service state updated to Active.")
     }
 

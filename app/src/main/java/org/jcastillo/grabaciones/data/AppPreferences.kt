@@ -80,6 +80,9 @@ class AppPreferences(context: Context) {
         const val SHOW_RECORDING_OVERLAY = false
         const val OVERLAY_Y_POSITION = -1
         const val ADB_PAIRED = false
+        // CallVault 1.4's off-Wi-Fi transport is opt-in because it opens a local
+        // RSA-authenticated classic-tcpip listener on adbd.
+        const val OFFLINE_RECORDING_ENABLED = false
     }
 
     /**
@@ -90,6 +93,8 @@ class AppPreferences(context: Context) {
         // --- Onboarding & Legal ---
         DISCLAIMER_ACCEPTED("disclaimer_accepted"),
         ADB_PAIRED("adb_paired"),
+        OFFLINE_RECORDING_ENABLED("offline_recording_enabled"),
+        LOOPBACK_ADB_PORT("loopback_adb_port"),
 
         // --- Others ---
         RECORDING_FOLDER_URI("recording_folder_uri"),
@@ -428,4 +433,25 @@ class AppPreferences(context: Context) {
 
     /** Records that the persistent local ADB identity was accepted by Android. */
     fun setAdbPaired(paired: Boolean) = setBoolean(Key.ADB_PAIRED, paired)
+
+    /**
+     * Whether the CallVault-compatible loopback transport is enabled. When enabled, the
+     * recorder prefers 127.0.0.1 and does not need Wi-Fi after the listener has been armed.
+     */
+    fun isOfflineRecordingEnabled() = getBoolean(
+        Key.OFFLINE_RECORDING_ENABLED,
+        DefaultsValue.OFFLINE_RECORDING_ENABLED,
+    )
+
+    fun setOfflineRecordingEnabled(enabled: Boolean) =
+        setBoolean(Key.OFFLINE_RECORDING_ENABLED, enabled)
+
+    /** Stable classic-tcpip port; it survives app process death and updates. */
+    fun getLoopbackAdbPort(): Int {
+        val existing = getInt(Key.LOOPBACK_ADB_PORT, 0)
+        if (existing in 47000..47999) return existing
+        val generated = 47000 + (kotlin.random.Random.nextInt(1000))
+        setInt(Key.LOOPBACK_ADB_PORT, generated)
+        return generated
+    }
 }

@@ -12,6 +12,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.ContactsContract
+import android.os.SystemClock
 import org.jcastillo.grabaciones.data.AppPreferences
 import org.jcastillo.grabaciones.data.call.CallDirection
 import org.jcastillo.grabaciones.data.call.EnrichedCallData
@@ -75,6 +76,7 @@ class RecordingDecisionEngine private constructor(context: Context) {
      * @return true is an Intent to start/standby the [org.jcastillo.grabaciones.services.recording.RecordingForegroundService] was fired successfully, false if there was an error
      */
     suspend fun executeDecisionPipeline(rawData: RawCallData): Boolean {
+        AppLogger.i( "[TIMING] decision-start ${SystemClock.elapsedRealtime()}ms direction=${rawData.direction}")
         AppLogger.i( "Starting recording decision pipeline for ${rawData.direction} call")
 
         // Step 1: Transform to EnrichedCallData
@@ -87,6 +89,16 @@ class RecordingDecisionEngine private constructor(context: Context) {
 
         // Step 3: Fire appropriate Intent
         return fireRecordingServiceIntent(enrichedData, shouldAutoRecord)
+    }
+
+    /**
+     * Pre-warms the foreground service and privileged daemon while the call is ringing/dialing.
+     * It never starts capture; the ACTIVE event still makes the recording decision.
+     */
+    suspend fun prepareRecording(rawData: RawCallData): Boolean {
+        val enrichedData = EnrichedCallData.enrichMetadata(appContext, rawData)
+        AppLogger.i("[TIMING] prewarm-intent ${SystemClock.elapsedRealtime()}ms direction=${rawData.direction}")
+        return fireRecordingServiceIntent(enrichedData, shouldAutoRecord = false)
     }
 
     /**
